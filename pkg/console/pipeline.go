@@ -43,12 +43,13 @@ const (
 )
 
 type AudioPipeline struct {
-	inputStream  *portaudio.Stream
-	outputStream *portaudio.Stream
-	apmInst      *apm.APM
-	noAEC        bool
-	conn         net.Conn
-	connMu       sync.Mutex // protects writes to conn
+	inputStream             *portaudio.Stream
+	outputStream            *portaudio.Stream
+	apmInst                 *apm.APM
+	noAEC                   bool
+	wasapiOutputAutoConvert bool
+	conn                    net.Conn
+	connMu                  sync.Mutex // protects writes to conn
 
 	captureRing  *RingBuffer
 	playbackRing *RingBuffer
@@ -80,23 +81,25 @@ type AudioPipeline struct {
 }
 
 type PipelineConfig struct {
-	InputDevice  *portaudio.DeviceInfo // nil to skip audio (text-only)
-	OutputDevice *portaudio.DeviceInfo // nil to skip audio (text-only)
-	NoAEC        bool
-	Conn         net.Conn
+	InputDevice             *portaudio.DeviceInfo // nil to skip audio (text-only)
+	OutputDevice            *portaudio.DeviceInfo // nil to skip audio (text-only)
+	NoAEC                   bool
+	WASAPIOutputAutoConvert bool
+	Conn                    net.Conn
 }
 
 func NewPipeline(cfg PipelineConfig) (*AudioPipeline, error) {
 	ap := &AudioPipeline{
-		conn:      cfg.Conn,
-		noAEC:     cfg.NoAEC,
-		Events:    make(chan *agent.AgentSessionEvent, 64),
-		Responses: make(chan *agent.SessionResponse, 16),
-		ready:     make(chan struct{}),
+		conn:                    cfg.Conn,
+		noAEC:                   cfg.NoAEC,
+		wasapiOutputAutoConvert: cfg.WASAPIOutputAutoConvert,
+		Events:                  make(chan *agent.AgentSessionEvent, 64),
+		Responses:               make(chan *agent.SessionResponse, 16),
+		ready:                   make(chan struct{}),
 	}
 
 	if cfg.InputDevice != nil && cfg.OutputDevice != nil {
-		if err := ap.initAudio(cfg.InputDevice, cfg.OutputDevice, cfg.NoAEC); err != nil {
+		if err := ap.initAudio(cfg.InputDevice, cfg.OutputDevice, cfg.NoAEC, cfg.WASAPIOutputAutoConvert); err != nil {
 			return nil, err
 		}
 	}
@@ -104,13 +107,15 @@ func NewPipeline(cfg PipelineConfig) (*AudioPipeline, error) {
 	return ap, nil
 }
 
-func (p *AudioPipeline) initAudio(inputDev, outputDev *portaudio.DeviceInfo, noAEC bool) error {
+func (p *AudioPipeline) initAudio(inputDev, outputDev *portaudio.DeviceInfo, noAEC, wasapiOutputAutoConvert bool) error {
 	inputStream, err := portaudio.OpenInputStream(inputDev, SampleRate, Channels, SamplesPerFrame)
 	if err != nil {
 		return err
 	}
 
-	outputStream, err := portaudio.OpenOutputStream(outputDev, SampleRate, Channels, SamplesPerFrame)
+	outputStream, err := portaudio.OpenOutputStreamWithOptions(outputDev, SampleRate, Channels, SamplesPerFrame, portaudio.OutputStreamOptions{
+		WASAPISharedAutoConvert: wasapiOutputAutoConvert,
+	})
 	if err != nil {
 		inputStream.Close()
 		return err
@@ -164,7 +169,7 @@ func (p *AudioPipeline) EnableAudio() error {
 		return fmt.Errorf("output device: %w", err)
 	}
 
-	if err := p.initAudio(inputDev, outputDev, p.noAEC); err != nil {
+	if err := p.initAudio(inputDev, outputDev, p.noAEC, p.wasapiOutputAutoConvert); err != nil {
 		portaudio.Terminate()
 		return err
 	}

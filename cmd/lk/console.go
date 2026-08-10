@@ -62,6 +62,10 @@ var consoleCommand = &cli.Command{
 			Usage: "Output device index or name substring",
 		},
 		&cli.BoolFlag{
+			Name:  "output-wasapi-auto-convert",
+			Usage: "Use Windows WASAPI shared-mode conversion for a device whose mix format differs from the 48 kHz console bus",
+		},
+		&cli.BoolFlag{
 			Name:  "list-devices",
 			Usage: "List available audio devices and exit",
 		},
@@ -195,10 +199,11 @@ func runConsole(ctx context.Context, cmd *cli.Command) error {
 		return ctx.Err()
 	}
 	pipeline, err := console.NewPipeline(console.PipelineConfig{
-		InputDevice:  inputDev,
-		OutputDevice: outputDev,
-		NoAEC:        cmd.Bool("no-aec"),
-		Conn:         conn,
+		InputDevice:             inputDev,
+		OutputDevice:            outputDev,
+		NoAEC:                   cmd.Bool("no-aec"),
+		WASAPIOutputAutoConvert: cmd.Bool("output-wasapi-auto-convert"),
+		Conn:                    conn,
 	})
 	if err != nil {
 		return fmt.Errorf("pipeline: %w", err)
