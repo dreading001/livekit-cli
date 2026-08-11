@@ -71,9 +71,10 @@ type AudioPipeline struct {
 	mu       sync.Mutex
 	fftBands [NumFFTBands]float64
 	muted    bool
-	paused   bool    // true when audio I/O is paused (e.g. text mode); mic frames are not sent to the agent
-	level    float64 // capture level in dB
-	playing  bool    // true when outputting real audio (not silence)
+	paused   bool       // true when audio I/O is paused (e.g. text mode); mic frames are not sent to the agent
+	level    float64    // capture level in dB
+	playing  bool       // true when outputting real audio (not silence)
+	apmStats *apm.Stats // speaker-loop snapshot; never call APM from the TUI goroutine
 
 	cancel   context.CancelFunc
 	audioCtx context.Context // stored so EnableAudio can start goroutines
@@ -303,11 +304,13 @@ func (p *AudioPipeline) IsPlaying() bool {
 }
 
 func (p *AudioPipeline) AECStats() *apm.Stats {
-	if p.apmInst == nil {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.apmStats == nil {
 		return nil
 	}
-	s := p.apmInst.GetStats()
-	return &s
+	snapshot := *p.apmStats
+	return &snapshot
 }
 
 // micLoop reads mic input at hardware rate and writes to the capture ring.
@@ -387,6 +390,14 @@ func (p *AudioPipeline) speakerLoop(ctx context.Context) {
 				_ = p.apmInst.ProcessCapture(apmBuf)
 				copy(captureBuf[i:], apmBuf)
 			}
+
+			// WebRTC APM is not thread-safe. Keep GetStatistics beside the
+			// render/capture calls on this owning goroutine, then let the TUI
+			// read only an ordinary Go snapshot.
+			stats := p.apmInst.GetStats()
+			p.mu.Lock()
+			p.apmStats = &stats
+			p.mu.Unlock()
 		}
 
 		// Write playback to speakers — blocks at hardware rate.
