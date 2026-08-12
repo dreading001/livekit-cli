@@ -174,6 +174,15 @@ type Stream struct {
 	isInput    bool
 }
 
+// OutputStreamOptions contains host-specific physical output adaptations.
+// The audio supplied to the stream remains in the requested application format.
+type OutputStreamOptions struct {
+	// WASAPISharedAutoConvert asks the Windows shared-mode audio engine to
+	// convert the application format to the selected device's mix format.
+	// It is rejected unless the selected PortAudio device is hosted by WASAPI.
+	WASAPISharedAutoConvert bool
+}
+
 func OpenInputStream(device *DeviceInfo, sampleRate, channels, framesPerBuffer int) (*Stream, error) {
 	params := C.PaStreamParameters{
 		device:                    C.PaDeviceIndex(device.Index),
@@ -207,16 +216,26 @@ func OpenInputStream(device *DeviceInfo, sampleRate, channels, framesPerBuffer i
 }
 
 func OpenOutputStream(device *DeviceInfo, sampleRate, channels, framesPerBuffer int) (*Stream, error) {
+	return OpenOutputStreamWithOptions(device, sampleRate, channels, framesPerBuffer, OutputStreamOptions{})
+}
+
+func OpenOutputStreamWithOptions(device *DeviceInfo, sampleRate, channels, framesPerBuffer int, options OutputStreamOptions) (*Stream, error) {
+	hostInfo, releaseHostInfo, err := outputStreamHostInfo(device, options)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHostInfo()
+
 	params := C.PaStreamParameters{
 		device:                    C.PaDeviceIndex(device.Index),
 		channelCount:              C.int(channels),
 		sampleFormat:              C.paInt16,
 		suggestedLatency:          C.PaTime(device.OutputLatency.Seconds()),
-		hostApiSpecificStreamInfo: nil,
+		hostApiSpecificStreamInfo: hostInfo,
 	}
 
 	var stream unsafe.Pointer
-	err := paError(C.Pa_OpenStream(
+	err = paError(C.Pa_OpenStream(
 		&stream,
 		nil,     // no input
 		&params, // output
@@ -236,6 +255,13 @@ func OpenOutputStream(device *DeviceInfo, sampleRate, channels, framesPerBuffer 
 		frames:     framesPerBuffer,
 		isInput:    false,
 	}, nil
+}
+
+func validateWASAPISharedAutoConvert(requested, isWASAPI bool, hostAPI string) error {
+	if !requested || isWASAPI {
+		return nil
+	}
+	return fmt.Errorf("portaudio: WASAPI shared-mode output auto-conversion requested, but selected output device uses %s", hostAPI)
 }
 
 func (s *Stream) Read(buf []int16) error {

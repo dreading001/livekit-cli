@@ -43,12 +43,13 @@ const (
 )
 
 type AudioPipeline struct {
-	inputStream  *portaudio.Stream
-	outputStream *portaudio.Stream
-	apmInst      *apm.APM
-	noAEC        bool
-	conn         net.Conn
-	connMu       sync.Mutex // protects writes to conn
+	inputStream             *portaudio.Stream
+	outputStream            *portaudio.Stream
+	apmInst                 *apm.APM
+	noAEC                   bool
+	wasapiOutputAutoConvert bool
+	conn                    net.Conn
+	connMu                  sync.Mutex // protects writes to conn
 
 	captureRing  *RingBuffer
 	playbackRing *RingBuffer
@@ -70,9 +71,10 @@ type AudioPipeline struct {
 	mu       sync.Mutex
 	fftBands [NumFFTBands]float64
 	muted    bool
-	paused   bool    // true when audio I/O is paused (e.g. text mode); mic frames are not sent to the agent
-	level    float64 // capture level in dB
-	playing  bool    // true when outputting real audio (not silence)
+	paused   bool       // true when audio I/O is paused (e.g. text mode); mic frames are not sent to the agent
+	level    float64    // capture level in dB
+	playing  bool       // true when outputting real audio (not silence)
+	apmStats *apm.Stats // speaker-loop snapshot; never call APM from the TUI goroutine
 
 	cancel   context.CancelFunc
 	audioCtx context.Context // stored so EnableAudio can start goroutines
@@ -80,23 +82,25 @@ type AudioPipeline struct {
 }
 
 type PipelineConfig struct {
-	InputDevice  *portaudio.DeviceInfo // nil to skip audio (text-only)
-	OutputDevice *portaudio.DeviceInfo // nil to skip audio (text-only)
-	NoAEC        bool
-	Conn         net.Conn
+	InputDevice             *portaudio.DeviceInfo // nil to skip audio (text-only)
+	OutputDevice            *portaudio.DeviceInfo // nil to skip audio (text-only)
+	NoAEC                   bool
+	WASAPIOutputAutoConvert bool
+	Conn                    net.Conn
 }
 
 func NewPipeline(cfg PipelineConfig) (*AudioPipeline, error) {
 	ap := &AudioPipeline{
-		conn:      cfg.Conn,
-		noAEC:     cfg.NoAEC,
-		Events:    make(chan *agent.AgentSessionEvent, 64),
-		Responses: make(chan *agent.SessionResponse, 16),
-		ready:     make(chan struct{}),
+		conn:                    cfg.Conn,
+		noAEC:                   cfg.NoAEC,
+		wasapiOutputAutoConvert: cfg.WASAPIOutputAutoConvert,
+		Events:                  make(chan *agent.AgentSessionEvent, 64),
+		Responses:               make(chan *agent.SessionResponse, 16),
+		ready:                   make(chan struct{}),
 	}
 
 	if cfg.InputDevice != nil && cfg.OutputDevice != nil {
-		if err := ap.initAudio(cfg.InputDevice, cfg.OutputDevice, cfg.NoAEC); err != nil {
+		if err := ap.initAudio(cfg.InputDevice, cfg.OutputDevice, cfg.NoAEC, cfg.WASAPIOutputAutoConvert); err != nil {
 			return nil, err
 		}
 	}
@@ -104,13 +108,15 @@ func NewPipeline(cfg PipelineConfig) (*AudioPipeline, error) {
 	return ap, nil
 }
 
-func (p *AudioPipeline) initAudio(inputDev, outputDev *portaudio.DeviceInfo, noAEC bool) error {
+func (p *AudioPipeline) initAudio(inputDev, outputDev *portaudio.DeviceInfo, noAEC, wasapiOutputAutoConvert bool) error {
 	inputStream, err := portaudio.OpenInputStream(inputDev, SampleRate, Channels, SamplesPerFrame)
 	if err != nil {
 		return err
 	}
 
-	outputStream, err := portaudio.OpenOutputStream(outputDev, SampleRate, Channels, SamplesPerFrame)
+	outputStream, err := portaudio.OpenOutputStreamWithOptions(outputDev, SampleRate, Channels, SamplesPerFrame, portaudio.OutputStreamOptions{
+		WASAPISharedAutoConvert: wasapiOutputAutoConvert,
+	})
 	if err != nil {
 		inputStream.Close()
 		return err
@@ -164,7 +170,7 @@ func (p *AudioPipeline) EnableAudio() error {
 		return fmt.Errorf("output device: %w", err)
 	}
 
-	if err := p.initAudio(inputDev, outputDev, p.noAEC); err != nil {
+	if err := p.initAudio(inputDev, outputDev, p.noAEC, p.wasapiOutputAutoConvert); err != nil {
 		portaudio.Terminate()
 		return err
 	}
@@ -298,11 +304,13 @@ func (p *AudioPipeline) IsPlaying() bool {
 }
 
 func (p *AudioPipeline) AECStats() *apm.Stats {
-	if p.apmInst == nil {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.apmStats == nil {
 		return nil
 	}
-	s := p.apmInst.GetStats()
-	return &s
+	snapshot := *p.apmStats
+	return &snapshot
 }
 
 // micLoop reads mic input at hardware rate and writes to the capture ring.
@@ -382,6 +390,14 @@ func (p *AudioPipeline) speakerLoop(ctx context.Context) {
 				_ = p.apmInst.ProcessCapture(apmBuf)
 				copy(captureBuf[i:], apmBuf)
 			}
+
+			// WebRTC APM is not thread-safe. Keep GetStatistics beside the
+			// render/capture calls on this owning goroutine, then let the TUI
+			// read only an ordinary Go snapshot.
+			stats := p.apmInst.GetStats()
+			p.mu.Lock()
+			p.apmStats = &stats
+			p.mu.Unlock()
 		}
 
 		// Write playback to speakers — blocks at hardware rate.
